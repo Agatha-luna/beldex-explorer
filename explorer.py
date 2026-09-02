@@ -330,6 +330,8 @@ def add_global_headers(response):
 
 @app.errorhandler(500)
 def internal_error(e):
+    print("daemon-busy page served for {} via 500 handler (see traceback above)".format(
+            flask.request.path), file=sys.stderr)
     # In this app an unhandled exception almost always traces back to a beldexd
     # RPC timeout while the daemon is busy/syncing (futures return None and
     # downstream code trips over it). Render a friendly auto-retrying page;
@@ -340,6 +342,24 @@ def internal_error(e):
 @app.route('/style.css')
 def css():
     return flask.send_from_directory('static', 'style.css')
+
+
+# Remember the last successful get_info so a momentarily-unresponsive daemon
+# serves slightly stale pages (with a warning strip) instead of the busy page.
+_last_info = {'data': None, 'ts': 0}
+_LAST_INFO_MAX_AGE = 600  # seconds
+
+def get_info_or_stale(inforeq):
+    """Returns (info, stale). Fresh result is cached; on failure the cached
+    copy is returned with stale=True while it is under 10 minutes old."""
+    info = inforeq.get()
+    if info:
+        _last_info['data'] = dict(info)
+        _last_info['ts'] = time.time()
+        return dict(info), False
+    if _last_info['data'] and time.time() - _last_info['ts'] < _LAST_INFO_MAX_AGE:
+        return dict(_last_info['data']), True
+    return None, False
 
 
 def get_mns_future(lmq, beldexd):
@@ -481,11 +501,16 @@ def main(refresh=None, page=0, per_page=None, first=None, last=None):
     # We have some chained request dependencies here and below, so get() them as needed; all other
     # non-dependent requests should already have a future initiated above so that they can
     # potentially run in parallel.
-    info = inforeq.get()
+    info, stale_info = get_info_or_stale(inforeq)
     if info is None:
-        # Even get_info timed out: daemon is unreachable or too busy to answer.
-        # Render a friendly auto-retrying page instead of crashing.
+        # get_info timed out and we have no recent cached copy: daemon is
+        # unreachable. Render a friendly auto-retrying page instead of crashing.
+        print("daemon-busy page served for {}: get_info timed out".format(flask.request.path),
+                file=sys.stderr)
         return flask.render_template('daemon_unavailable.html', info=None), 503
+    if stale_info:
+        print("serving {} with cached get_info (daemon busy)".format(flask.request.path),
+                file=sys.stderr)
     height = info['height']
     info['testnet']  = info['nettype'] == 'testnet'
     info['devnet']   = info['nettype'] == 'devnet'
@@ -551,6 +576,9 @@ def main(refresh=None, page=0, per_page=None, first=None, last=None):
         else:
             mn_counts['awaiting'] += 1
 
+    supply = fetch_circulating_supply()
+    circulating_supply = supply * 1_000_000_000 if supply is not None else None
+
     # Fall back to safe defaults for any RPC that failed/timed out so a busy
     # daemon degrades the page instead of 500ing it.
     return flask.render_template('index.html',
@@ -560,6 +588,7 @@ def main(refresh=None, page=0, per_page=None, first=None, last=None):
             fees=base_fee.get() or {'fee_per_byte': 0, 'fee_per_output': 0,
                 'flash_fee_per_byte': 0, 'flash_fee_per_output': 0, 'flash_fee_fixed': 0},
             emission=coinbase.get(),
+            circulating_supply=circulating_supply,
             hf=hfinfo.get() or {'version': 0},
             mn_counts=mn_counts,
             blocks=blocks,
@@ -570,6 +599,7 @@ def main(refresh=None, page=0, per_page=None, first=None, last=None):
             mempool=parse_mempool(mempool) or {'txs': []},
             checkpoints=checkpoints.get(),
             refresh=refresh,
+            stale_info=stale_info,
             )
 
 
@@ -1612,6 +1642,22 @@ def show_tx_info(txid, more_details=False):
             "status": "success"
             })
 
+circulating_supply_cache, circulating_supply_cache_expires = None, None
+def fetch_circulating_supply():
+    """Fetches the circulating supply (in whole BDX) from api.beldex.io, caching the result
+    for 5 minutes. Returns None if the fetch fails and no cached value is available yet."""
+    global circulating_supply_cache, circulating_supply_cache_expires
+    if not circulating_supply_cache_expires or circulating_supply_cache_expires < time.time():
+        try:
+            r = requests.get("https://api.beldex.io/api/v1/bdx/circulating-supply", timeout=5)
+            r.raise_for_status()
+            circulating_supply_cache = float(r.text)
+            circulating_supply_cache_expires = time.time() + 300
+        except Exception as e:
+            print("Failed to retrieve circulating supply: {}".format(e), file=sys.stderr)
+    return circulating_supply_cache
+
+
 @app.route('/api/emission')
 def api_emission():
     lmq, beldexd = lmq_connection()
@@ -1621,11 +1667,14 @@ def api_emission():
     if not coinbase:
         return flask.jsonify(None)
     info = info.get()
+    supply = fetch_circulating_supply()
+    circulating_supply = (supply * 1_000_000_000 if supply is not None
+            else coinbase["emission_amount"] - coinbase["burn_amount"])
     return flask.jsonify({
         "data": {
             "blk_no": info['height'] - 1,
             "burn": coinbase["burn_amount"],
-            "circulating_supply": coinbase["emission_amount"] - coinbase["burn_amount"],
+            "circulating_supply": circulating_supply,
             "coinbase": coinbase["emission_amount"] - coinbase["burn_amount"],
             "emission": coinbase["emission_amount"],
             "fee": coinbase["fee_amount"]
@@ -1671,6 +1720,9 @@ def api_master_node_stats():
 
 @app.route('/api/circulating_supply')
 def api_circulating_supply():
+    supply = fetch_circulating_supply()
+    if supply is not None:
+        return flask.jsonify(int(supply))
     lmq, beldexd = lmq_connection()
     coinbase = FutureJSON(lmq, beldexd, 'admin.get_coinbase_tx_sum', 10, timeout=1, fail_okay=True,
             args={"height":0, "count":2**31-1}).get()
@@ -1763,11 +1815,31 @@ def api_price(fiat=None):
 # ---------------------------------------------------------------------------
 
 _stats_history_cache = {'data': None, 'expiry': 0}
+
+# Last fully-computed burn figures survive daemon busyness and restarts in a
+# small JSON file next to the code, so the burn chart can show the previous
+# values (marked with when they were calculated) instead of a pending note.
+import os as _os
+_STATS_DISK_CACHE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '.stats_cache.json')
+
+def _load_disk_stats():
+    try:
+        with open(_STATS_DISK_CACHE) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _save_disk_stats(data):
+    try:
+        with open(_STATS_DISK_CACHE, 'w') as f:
+            json.dump(data, f)
+    except Exception as e:
+        print("Failed to save stats cache: {}".format(e), file=sys.stderr)
 _STATS_MAX_YEARS = 8          # how many calendar years of history to chart
 _STATS_SAMPLE = 30            # block headers sampled per year
 _BLOCK_TIME = 30              # target seconds per block
 
-def _stats_history(lmq, beldexd, height, now_ts):
+def _stats_history(lmq, beldexd, height, now_ts, include_burn=False):
     """Yearly series (estimates from sampled headers + real per-year burn from
     the admin coinbase RPC), cached for 6h. Returns None if the daemon cannot
     answer."""
@@ -1775,13 +1847,27 @@ def _stats_history(lmq, beldexd, height, now_ts):
         return _stats_history_cache['data']
 
     try:
-        now_dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
+        # Anchor the year<->height mapping on the top block's real timestamp,
+        # not the wall clock: while the daemon is still syncing the tip can be
+        # months behind "now", which would shift every year bucket backwards.
+        anchor_ts = now_ts
+        try:
+            top = FutureJSON(lmq, beldexd, 'rpc.get_block_header_by_height', 60,
+                    cache_key='stats_top', args={'height': height - 1}).get()
+            if top and top.get('block_header', {}).get('timestamp'):
+                anchor_ts = top['block_header']['timestamp']
+        except Exception:
+            pass
+
+        now_dt = datetime.fromtimestamp(anchor_ts, tz=timezone.utc)
+        print("stats: anchor timestamp {} ({}), tip height {}".format(
+                int(anchor_ts), now_dt.strftime('%Y-%m-%d'), height - 1), file=sys.stderr)
         years = list(range(now_dt.year - _STATS_MAX_YEARS + 1, now_dt.year + 1))
         # Approximate chain height at each Jan 1 from the target block time
         bounds = []
         for y in years:
             ts = datetime(y, 1, 1, tzinfo=timezone.utc).timestamp()
-            bounds.append(max(0, height - 1 - int((now_ts - ts) // _BLOCK_TIME)))
+            bounds.append(max(0, height - 1 - int((anchor_ts - ts) // _BLOCK_TIME)))
         bounds.append(height - 1)  # current year runs to the tip
 
         # Fire everything up-front so the requests run in parallel
@@ -1789,6 +1875,8 @@ def _stats_history(lmq, beldexd, height, now_ts):
         for i, y in enumerate(years):
             start_h, end_h = bounds[i], bounds[i + 1]
             if end_h - start_h < 10:  # chain younger than this year
+                print("stats: skipping year {}: only {} blocks in range".format(
+                        y, end_h - start_h), file=sys.stderr)
                 header_futs.append(None)
                 burn_futs.append(None)
                 continue
@@ -1796,9 +1884,13 @@ def _stats_history(lmq, beldexd, height, now_ts):
             header_futs.append(FutureJSON(lmq, beldexd, 'rpc.get_block_headers_range', 21600,
                     cache_key='statsy{}'.format(y),
                     args={'start_height': mid, 'end_height': min(mid + _STATS_SAMPLE - 1, end_h)}))
+            # Per-year coinbase sums are expensive for the daemon; only request
+            # them once the cheap totals call reports the daemon's coinbase
+            # cache is ready (include_burn), so we never pile heavy scans onto
+            # a busy/syncing daemon.
             burn_futs.append(FutureJSON(lmq, beldexd, 'admin.get_coinbase_tx_sum', 21600,
                     cache_key='statsburn{}'.format(y), timeout=5, fail_okay=True,
-                    args={'height': start_h, 'count': end_h - start_h}))
+                    args={'height': start_h, 'count': end_h - start_h}) if include_burn else None)
 
         # Master node registrations: registration_height of the currently
         # registered set, bucketed by (approximate) year
@@ -1813,6 +1905,8 @@ def _stats_history(lmq, beldexd, height, now_ts):
                 continue
             headers = ((fut.get() or {}).get('headers')) or []
             if not headers:
+                print("stats: year {} dropped: header sample RPC returned nothing "
+                        "(daemon busy?)".format(years[i]), file=sys.stderr)
                 continue
             start_h, end_h = bounds[i], bounds[i + 1]
             nblocks = end_h - start_h
@@ -1853,13 +1947,42 @@ def _stats_history(lmq, beldexd, height, now_ts):
             print("stats: mn registration history unavailable: {}".format(e), file=sys.stderr)
 
         data = {'years': yearly, 'mn_years': mn_years} if yearly else None
+
+        if data:
+            fresh_burn_missing = any(y.get('burned') is None for y in yearly)
+            if not fresh_burn_missing:
+                # Full burn set fresh from the daemon: remember it for later
+                _save_disk_stats({'years': [{'label': y['label'], 'burned': y['burned']}
+                        for y in yearly], 'saved_at': now_ts})
+            else:
+                # Fill gaps from the last successful calculation, if any
+                disk = _load_disk_stats()
+                if disk:
+                    saved = {y['label']: y.get('burned') for y in disk.get('years', [])}
+                    filled = False
+                    for y in yearly:
+                        if y.get('burned') is None and saved.get(y['label']) is not None:
+                            y['burned'] = saved[y['label']]
+                            filled = True
+                    if filled:
+                        data['burn_asof'] = disk.get('saved_at')
+            data['_burn_pending'] = fresh_burn_missing
     except Exception as e:
         print("stats history unavailable: {}".format(e), file=sys.stderr)
         data = None
 
     if data:
         _stats_history_cache['data'] = data
-        _stats_history_cache['expiry'] = now_ts + 6 * 3600
+        burn_pending = data.pop('_burn_pending', False)
+        # An incomplete series (newest year missing, e.g. its sample RPC timed
+        # out) or pending burn figures: retry soon instead of caching for 6h.
+        newest_missing = not data['years'] or \
+                data['years'][-1]['label'] != str(datetime.fromtimestamp(
+                    now_ts, tz=timezone.utc).year)
+        if newest_missing:
+            print("stats: newest year missing from series; will rebuild in 10 min",
+                    file=sys.stderr)
+        _stats_history_cache['expiry'] = now_ts + (600 if (burn_pending or newest_missing) else 6 * 3600)
     return data
 
 
@@ -1874,8 +1997,9 @@ def stats():
     coinbase = FutureJSON(lmq, beldexd, 'admin.get_coinbase_tx_sum', 120, timeout=1, fail_okay=True,
             args={"height": 0, "count": 2**31-1})
 
-    info = inforeq.get()
+    info, stale_info = get_info_or_stale(inforeq)
     if info is None:
+        print("daemon-busy page served for /stats: get_info timed out", file=sys.stderr)
         return flask.render_template('daemon_unavailable.html', info=None), 503
     info['testnet'] = info['nettype'] == 'testnet'
     info['devnet'] = info['nettype'] == 'devnet'
@@ -1899,10 +2023,14 @@ def stats():
     except Exception:
         mp = {}
 
-    history = _stats_history(lmq, beldexd, height, now_ts)
-
     emission = coinbase.get()
+    history = _stats_history(lmq, beldexd, height, now_ts,
+            include_burn=bool(emission and emission.get('status') == 'OK'))
+
     bns_counts = info.get('bns_counts', 0)
+
+    supply = fetch_circulating_supply()
+    circulating_supply = supply * 1_000_000_000 if supply is not None else None
 
     # ---- derived insights ------------------------------------------------
     insights = []
@@ -1956,7 +2084,7 @@ def stats():
                     mn_years[-1]['cumulative']),
             })
         if emission and emission.get('status') == 'OK':
-            circ = emission['emission_amount'] - emission['burn_amount']
+            circ = circulating_supply if circulating_supply is not None else emission['emission_amount'] - emission['burn_amount']
             if emission['emission_amount']:
                 burn_pct = emission['burn_amount'] / emission['emission_amount'] * 100
                 insights.append({
@@ -1978,11 +2106,44 @@ def stats():
     except Exception as e:
         print("stats insights failed: {}".format(e), file=sys.stderr)
 
+    # BNS registrations over years: the RPC only exposes the current total, so
+    # persist a yearly snapshot and interpolate between known points (implicit
+    # zero before the first charted year). Grows more accurate over time.
+    total_bns = sum(bns_counts) if isinstance(bns_counts, (list, tuple)) else (bns_counts or 0)
+    if history and history.get('years'):
+        try:
+            disk = _load_disk_stats() or {}
+            snaps = disk.get('bns_snapshots', {})
+            labels = [y['label'] for y in history['years']]
+            cur_year = labels[-1]
+            if total_bns and snaps.get(cur_year, 0) < total_bns:
+                snaps[cur_year] = total_bns
+                disk['bns_snapshots'] = snaps
+                _save_disk_stats(disk)
+            anchor_pts = [(-1, 0)] + sorted(
+                    (labels.index(y), v) for y, v in snaps.items() if y in labels)
+            series = []
+            for i in range(len(labels)):
+                lo = max((p for p in anchor_pts if p[0] <= i), key=lambda p: p[0])
+                highs = [p for p in anchor_pts if p[0] > i]
+                if not highs:
+                    val = lo[1]
+                else:
+                    hi = min(highs, key=lambda p: p[0])
+                    val = lo[1] + (hi[1] - lo[1]) * (i - lo[0]) / (hi[0] - lo[0])
+                series.append(round(val))
+            history['bns_years'] = [
+                    {'label': l, 'cumulative': v} for l, v in zip(labels, series)]
+        except Exception as e:
+            print("stats: bns series failed: {}".format(e), file=sys.stderr)
+
     return flask.render_template('stats.html',
             insights=insights,
+            stale_info=stale_info,
             info=info,
             stake=stake.get() or {'staking_requirement': 0},
             emission=emission,
+            circulating_supply=circulating_supply,
             mn_counts=mn_counts,
             bns_counts=bns_counts,
             mempool_count=len(mp.get('txs', [])),

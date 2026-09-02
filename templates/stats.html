@@ -3,6 +3,9 @@
 {% block title %}Stats — {% endblock %}
 
 {% block content %}
+{% if stale_info %}
+<div class="stale-banner">Daemon busy — showing recently cached data; refreshes automatically once it responds.</div>
+{% endif %}
 <div class="Wrapper">
 
     <div class="hero" style="padding: 24px 0 8px">
@@ -23,8 +26,10 @@
         </div>
         <div class="stat-card">
             <span class="label">Circulating supply</span>
-            {% if emission and emission.status == 'OK' %}
-                <span class="value">{{(emission.emission_amount - emission.burn_amount) | beldex(tag=False, decimals=0)}}<span class="unit">BDX</span></span>
+            {% if circulating_supply is not none %}
+                <span class="value" title="{{circulating_supply | beldex(tag=False, decimals=0)}} BDX">{{(circulating_supply / 1e18) | roundish | chop0}}<span class="unit">B BDX</span></span>
+            {% elif emission and emission.status == 'OK' %}
+                <span class="value" title="{{(emission.emission_amount - emission.burn_amount) | beldex(tag=False, decimals=0)}} BDX">{{((emission.emission_amount - emission.burn_amount) / 1e18) | roundish | chop0}}<span class="unit">B BDX</span></span>
             {% else %}
                 <span class="value">…</span><span class="note">still calculating</span>
             {% endif %}
@@ -32,7 +37,7 @@
         <div class="stat-card">
             <span class="label">Total BDX burned</span>
             {% if emission and emission.status == 'OK' %}
-                <span class="value">{{emission.burn_amount | beldex(tag=False, decimals=0)}}<span class="unit">BDX</span></span>
+                <span class="value" title="{{emission.burn_amount | beldex(tag=False, decimals=0)}} BDX">{{(emission.burn_amount / 1e15) | roundish | chop0}}<span class="unit">M BDX</span></span>
             {% else %}
                 <span class="value">…</span><span class="note">still calculating</span>
             {% endif %}
@@ -42,9 +47,9 @@
             <span class="value" style="color: var(--green)">{{mn_counts.active}}</span>
             <span class="note">{{mn_counts.awaiting}} awaiting · {{mn_counts.decommissioned}} decommissioned</span>
         </div>
-        <div class="stat-card" title="Value staked by active master nodes (nodes × requirement)">
+        <div class="stat-card" title="Value staked by active master nodes (nodes × requirement): {{(mn_counts.active * stake.staking_requirement) | beldex(tag=False, decimals=0)}} BDX">
             <span class="label">Total value staked</span>
-            <span class="value">{{(mn_counts.active * stake.staking_requirement) | beldex(tag=False, decimals=0)}}<span class="unit">BDX</span></span>
+            <span class="value">{{((mn_counts.active * stake.staking_requirement) / 1e15) | roundish | chop0}}<span class="unit">M BDX</span></span>
         </div>
         <div class="stat-card">
             <span class="label">BNS names</span>
@@ -92,8 +97,8 @@
         <div class="chart-panel"><h2 class="chart-title">Transactions / year <span class="chart-sub">estimated</span></h2><svg data-chart="txs"></svg></div>
         <div class="chart-panel"><h2 class="chart-title">Cumulative transactions <span class="chart-sub">estimated</span></h2><svg data-chart="cum_txs"></svg></div>
         <div class="chart-panel"><h2 class="chart-title">Master nodes <span class="chart-sub">registered set, cumulative by reg. year</span></h2><svg data-chart="mn_cum"></svg></div>
-        <div class="chart-panel"><h2 class="chart-title">BNS registered <span class="chart-sub">current split by type</span></h2><svg data-chart="bns"></svg></div>
-        <div class="chart-panel"><h2 class="chart-title">BDX burned / year <span class="chart-sub">BDX</span></h2><svg data-chart="burned"></svg></div>
+        <div class="chart-panel"><h2 class="chart-title">BNS registered <span class="chart-sub">cumulative, estimated between snapshots</span></h2><svg data-chart="bns"></svg></div>
+        <div class="chart-panel"><h2 class="chart-title">BDX burned / year <span class="chart-sub">BDX{% if history.burn_asof %} · last calculated {{ history.burn_asof | from_timestamp | ago }} ago{% endif %}</span></h2><svg data-chart="burned"></svg></div>
         <div class="chart-panel"><h2 class="chart-title">Avg block size <span class="chart-sub">bytes</span></h2><svg data-chart="avg_block_size"></svg></div>
         <div class="chart-panel"><h2 class="chart-title">Block reward <span class="chart-sub">BDX, yearly avg</span></h2><svg data-chart="avg_reward"></svg></div>
     </div>
@@ -218,21 +223,21 @@
                 return;
             }
             if (key === 'bns') {
-                var bLabels, bData;
-                if (Array.isArray(BNS)) {
-                    var names = ['BChat', 'Wallet', 'Belnet', 'ETH'];
-                    bLabels = BNS.map(function(_, i) { return names[i] || ('Type ' + i); });
-                    bData = BNS;
-                } else {
-                    bLabels = ['Total'];
-                    bData = [BNS || 0];
-                }
-                drawBars(svg, bLabels, bData);
+                var BY = H.bns_years || [];
+                if (!BY.length) { panel.style.display = 'none'; return; }
+                drawChart(svg, BY.map(function(b) { return b.label; }),
+                          BY.map(function(b) { return b.cumulative; }));
                 return;
             }
             if (key === 'burned') {
                 var burnedOk = Q.filter(function(q) { return q.burned !== null && q.burned !== undefined; });
-                if (!burnedOk.length) { panel.style.display = 'none'; return; }
+                if (!burnedOk.length) {
+                    var note = document.createElement('p');
+                    note.className = 'chart-pending';
+                    note.textContent = 'The daemon is still computing burn totals (admin coinbase scan) — this chart fills in automatically once it finishes.';
+                    svg.replaceWith(note);
+                    return;
+                }
                 drawBars(svg, burnedOk.map(function(q) { return q.label; }),
                          burnedOk.map(function(q) { return q.burned; }));
                 return;
